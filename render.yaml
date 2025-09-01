@@ -2,7 +2,7 @@ services:
   - type: web
     name: fastapi-sql-gateway
     env: python
-    buildCommand: "pip install -r requirements.txt && python init_db.py"
+    buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn app:app --host 0.0.0.0 --port 10000"
     envVars:
       - key: DB_URL
