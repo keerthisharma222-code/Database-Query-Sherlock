@@ -1,102 +1,72 @@
 import os
-import re
-import json
-from typing import Any, Dict, List, Optional
-
-from fastapi import FastAPI, HTTPException, Body, Header
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from sqlalchemy import create_engine, text, inspect
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from typing import Optional
 
 # --- Config ---
-DB_URL = os.getenv("DB_URL", "sqlite:///sample.db")  # Start with SQLite
-API_KEY = os.getenv("API_KEY")  # Optional: set to enable x-api-key auth
+DATA_DIR = os.getenv("DATA_DIR", "data")  # Folder containing CSV files
 ROW_LIMIT_DEFAULT = int(os.getenv("ROW_LIMIT_DEFAULT", "200"))
 
+# --- Load CSVs ---
+tables = {}
+for file in os.listdir(DATA_DIR):
+    if file.endswith(".csv"):
+        table_name = file.replace(".csv", "")
+        tables[table_name] = pd.read_csv(os.path.join(DATA_DIR, file))
+
 # --- App ---
-app = FastAPI(title="SQL Gateway", version="1.0")
-
-def get_engine() -> Engine:
-    # pool_pre_ping helps avoid stale connections in cloud DBs
-    return create_engine(DB_URL, pool_pre_ping=True)
-
-engine = get_engine()
-
-def is_safe_select(sql: str) -> bool:
-    """Very simple guardrail: allow only read-only statements."""
-    s = re.sub(r"--.*?$|/\*.*?\*/", "", sql, flags=re.S | re.M).strip().lower()
-    # Disallow multiple statements
-    if ";" in s.strip().rstrip(";"):
-        return False
-    # Must start with WITH/SELECT/EXPLAIN/SHOW/DESCRIBE/PRAGMA (sqlite)
-    allowed_starts = ("with", "select", "explain", "show", "describe", "pragma")
-    if not s.startswith(allowed_starts):
-        return False
-    # Ban common DDL/DML keywords
-    banned = [
-        r"\binsert\b", r"\bupdate\b", r"\bdelete\b", r"\bdrop\b",
-        r"\btruncate\b", r"\balter\b", r"\bcreate\b(?!\s+temp)",  # allow temp if you like
-        r"\breplace\b", r"\bgrant\b", r"\brevoke\b", r"\battach\b", r"\bvacuum\b"
-    ]
-    return not any(re.search(pat, s) for pat in banned)
-
-def enforce_limit(sql: str) -> str:
-    s = sql.strip()
-    # If already has LIMIT/TOP, leave as-is
-    if re.search(r"\blimit\s+\d+\b", s, flags=re.I) or re.search(r"\btop\s+\d+\b", s, flags=re.I):
-        return s
-    # Generic LIMIT wrapper works for SQLite/Postgres/MySQL
-    return f"SELECT * FROM ({s}) AS _sub LIMIT {ROW_LIMIT_DEFAULT}"
-
-def require_api_key(header_key: Optional[str]):
-    if API_KEY and header_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-class SqlRequest(BaseModel):
-    query: str
-    params: Optional[Dict[str, Any]] = None
+app = FastAPI(title="CSV Gateway", version="1.0")
 
 @app.get("/health")
 def health():
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
+    if tables:
+        return {"status": "ok", "tables_loaded": list(tables.keys())}
+    return JSONResponse(status_code=500, content={"status": "error", "detail": "No CSV files found"})
 
 @app.get("/schema")
-def schema(x_api_key: Optional[str] = Header(None)):
-    require_api_key(x_api_key)
-    try:
-        insp = inspect(engine)
-        tables = []
-        for tbl in insp.get_table_names():
-            cols = insp.get_columns(tbl)
-            tables.append({
-                "table": tbl,
-                "columns": [{"name": c["name"], "type": str(c["type"]), "nullable": c.get("nullable", True)} for c in cols]
-            })
-        return {"db_url": DB_URL.split("://", 1)[0] + "://...", "tables": tables}
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def schema():
+    schema_info = []
+    for name, df in tables.items():
+        schema_info.append({
+            "table": name,
+            "columns": [{"name": col, "type": str(df[col].dtype)} for col in df.columns]
+        })
+    return {"tables": schema_info}
 
-@app.post("/sql")
-def run_sql(payload: SqlRequest = Body(...), x_api_key: Optional[str] = Header(None)):
-    require_api_key(x_api_key)
-    sql = payload.query
-    if not is_safe_select(sql):
-        raise HTTPException(status_code=400, detail="Only single-statement, read-only SELECT/EXPLAIN/SHOW queries are allowed.")
+@app.get("/query")
+def query(table: str, filter_column: Optional[str] = None, filter_value: Optional[str] = None, limit: int = ROW_LIMIT_DEFAULT):
+    if table not in tables:
+        raise HTTPException(status_code=400, detail=f"Table '{table}' not found")
+    
+    df = tables[table]
+    if filter_column and filter_value:
+        if filter_column not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Column '{filter_column}' not found in table '{table}'")
+        df = df[df[filter_column].astype(str) == filter_value]
+    
+    return {"rows": df.head(limit).to_dict(orient="records"), "row_count": len(df)}
 
-    sql_limited = enforce_limit(sql)
-    try:
-        with engine.connect() as conn:
-            result = conn.execute(text(sql_limited), parameters=payload.params or {})
-            rows = [dict(r._mapping) for r in result]
-            # try include dialect name for downstream decisions if needed
-            dialect = conn.dialect.name
-        return {"rows": rows, "row_count": len(rows), "limit_applied": sql_limited != sql, "dialect": dialect}
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+@app.get("/report")
+def report(table: str, format: str = "csv"):
+    if table not in tables:
+        raise HTTPException(status_code=400, detail=f"Table '{table}' not found")
+    
+    file_name = f"{table}_report.{format}"
+    file_path = os.path.join(DATA_DIR, file_name)
+    
+    if format == "csv":
+        tables[table].to_csv(file_path, index=False)
+    elif format == "excel":
+        tables[table].to_excel(file_path, index=False)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported format. Use 'csv' or 'excel'.")
+    
+    return {"file_link": f"/download/{file_name}"}
+
+@app.get("/download/{file_name}")
+def download(file_name: str):
+    file_path = os.path.join(DATA_DIR, file_name)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return JSONResponse(content={"message": f"Download {file_name} from {file_path}"})
