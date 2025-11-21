@@ -1,49 +1,35 @@
 import os
-from sqlalchemy import create_engine, text
+import pandas as pd
 
-DB_URL = os.getenv("DB_URL", "sqlite:///sample.db")
-engine = create_engine(DB_URL)
+# Directory to store CSV files
+data_dir = "data"
+os.makedirs(data_dir, exist_ok=True)
 
-ddl = """
-CREATE TABLE IF NOT EXISTS customers (
-  customer_id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL,
-  city TEXT,
-  signup_date TEXT
-);
-CREATE TABLE IF NOT EXISTS orders (
-  order_id INTEGER PRIMARY KEY,
-  customer_id INTEGER NOT NULL,
-  order_date TEXT NOT NULL,
-  amount REAL NOT NULL,
-  FOREIGN KEY(customer_id) REFERENCES customers(customer_id)
-);
-"""
-seed = """
-INSERT INTO customers (customer_id, name, city, signup_date) VALUES
-  (1,'Alice','Hyderabad','2024-01-05'),
-  (2,'Bob','Bengaluru','2024-03-11'),
-  (3,'Chitra','Chennai','2024-04-20')
-ON CONFLICT DO NOTHING;
+# Define file paths
+customers_file = os.path.join(data_dir, "customers.csv")
+orders_file = os.path.join(data_dir, "orders.csv")
 
-INSERT INTO orders (order_id, customer_id, order_date, amount) VALUES
-  (101,1,'2024-05-01',199.99),
-  (102,2,'2024-05-03',79.49),
-  (103,1,'2024-05-09',25.00),
-  (104,3,'2024-06-15',300.00)
-ON CONFLICT DO NOTHING;
-"""
+# Sample data for customers and orders
+customers_data = [
+    {"customer_id": 1, "name": "Alice", "city": "Hyderabad", "signup_date": "2024-01-05"},
+    {"customer_id": 2, "name": "Bob", "city": "Bengaluru", "signup_date": "2024-03-11"},
+    {"customer_id": 3, "name": "Chitra", "city": "Chennai", "signup_date": "2024-04-20"}
+]
 
-with engine.begin() as conn:
-    # SQLite doesn't understand ON CONFLICT DO NOTHING in all variants; ignore failures
-    for stmt in ddl.strip().split(";\n"):
-        if stmt.strip():
-            conn.execute(text(stmt))
-    try:
-        for stmt in seed.strip().split(";\n\n"):
-            if stmt.strip():
-                conn.execute(text(stmt))
-    except Exception:
-        pass
+orders_data = [
+    {"order_id": 101, "customer_id": 1, "order_date": "2024-05-01", "amount": 199.99},
+    {"order_id": 102, "customer_id": 2, "order_date": "2024-05-03", "amount": 79.49},
+    {"order_id": 103, "customer_id": 1, "order_date": "2024-05-09", "amount": 25.00},
+    {"order_id": 104, "customer_id": 3, "order_date": "2024-06-15", "amount": 300.00}
+]
 
-print("Initialized sample DB at", DB_URL)
+# Create CSV files if they don't exist
+if not os.path.exists(customers_file):
+    pd.DataFrame(customers_data).to_csv(customers_file, index=False)
+
+if not os.path.exists(orders_file):
+    pd.DataFrame(orders_data).to_csv(orders_file, index=False)
+
+print(f"Initialized sample CSV data in '{data_dir}' directory:")
+print(f"- {customers_file}")
+print(f"- {orders_file}")
